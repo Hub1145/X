@@ -946,23 +946,25 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         all_data = []
-        max_candles_limit = 300
+        max_candles_limit = 100
 
-        current_before_ms = end_ts_ms
+        current_after_ms = start_ts_ms
 
-        while True:
+        while current_after_ms < end_ts_ms:
             params = {
                 "instId": symbol,
                 "bar": okx_timeframe,
-                "before": str(current_before_ms),
+                "after": str(current_after_ms),
                 "limit": str(max_candles_limit)
             }
 
             response = okx_request("GET", path, params=params)
+            log_message(f"OKX history API response for {timeframe}: {response}", section="DEBUG")
 
             if response and response.get('code') == '0':
                 rows = response.get('data', [])
                 if rows:
+                    log_message(f"Fetched {len(rows)} candles for {timeframe}", section="DATA")
                     parsed_klines = []
                     for kline in rows:
                         try:
@@ -978,21 +980,28 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
 
+                    # OKX returns data in descending order (newest first), so we reverse it
                     all_data.extend(parsed_klines[::-1])
-                    current_before_ms = int(rows[-1][0]) - 1
 
-                    if int(rows[-1][0]) <= start_ts_ms or len(rows) < max_candles_limit:
-                        break
+                    # Update the timestamp to the latest one from the response
+                    current_after_ms = int(rows[0][0])
+
+                    if len(rows) < max_candles_limit:
+                        break # No more data to fetch
                 else:
-                    break
+                    break # No more data
 
                 sleep(0.3)
             else:
                 log_message(f"Error fetching OKX klines: {response}", section="ERROR")
                 return []
 
-        final_data = [kline for kline in all_data if start_ts_ms <= kline[0] <= end_ts_ms]
-        return final_data
+        # Filter data to be within the requested range and remove duplicates
+        final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        final_data = final_data.drop_duplicates(subset=['Timestamp'])
+        final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
+
+        return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
         return []
