@@ -37,7 +37,8 @@ from time import time, sleep
 import threading
 import traceback
 import gc
-from okx import OkxSocketClient
+import websocket
+import _thread
 
 # ================================================================================
 
@@ -127,6 +128,8 @@ MIN_CONTRACT_QTY = 0
 ws_authenticated = threading.Event()
 ws_subscriptions_ready = threading.Event()
 bot_startup_complete = False
+subscribed_channels = set()
+required_channels_count = 0
 
 entry_sl_price = 0.0
 sl_hit_triggered = False
@@ -775,80 +778,48 @@ def okx_transfer_funds(ccy, amount, from_account, to_account):
         return False
 
 def update_account_info():
-    """Updates global account balance for OKX contracts and prints it.
-    Fallback to overall account equity if currency-specific details are missing.
+    """
+    Updates the global futures account balance for OKX.
+    This function now correctly queries the unified trading account balance.
     """
     global account_balance, available_balance
 
     try:
-        # Step 1: Check Funding Account for USDT balance (optional)
-        path_funding = "/api/v5/asset/balances"
-        params_funding = {"ccy": CURRENCY}
-        response_funding = okx_request("GET", path_funding, params=params_funding)
-        log_message(f"Funding Account Balance Response: {response_funding}", section="DEBUG")
+        # The /api/v5/account/balance endpoint provides details for the unified
+        # account, which includes futures/swap trading.
+        path = "/api/v5/account/balance"
+        params = {"ccy": CURRENCY}
+        response = okx_request("GET", path, params=params)
+        log_message(f"Trading Account Balance Response: {response}", section="DEBUG")
 
-        if response_funding and response_funding.get('code') == '0':
-            funding_data = response_funding.get('data', [])
-            usdt_in_funding = 0.0
-            if funding_data:
-                for item in funding_data:
-                    if item.get('ccy') == CURRENCY:
-                        usdt_in_funding = safe_float(item.get('availBal', '0'))
-                        break
-            log_message(f"USDT in Funding Account: {usdt_in_funding}", section="ACCOUNT")
+        if response and response.get('code') == '0':
+            data = response.get('data', [])
+            if data and len(data) > 0:
+                account_details = data[0]
 
-            if usdt_in_funding > 0:
-                log_message(f"Found {usdt_in_funding:.8f} {CURRENCY} in Funding Account. Attempting transfer to Trading Account...", section="ACCOUNT")
-                transfer_success = okx_transfer_funds(CURRENCY, usdt_in_funding, 6, 18)  # 6: Funding, 18: Trading
-                log_message(f"Funds transfer success: {transfer_success}", section="ACCOUNT")
-                if transfer_success:
-                    sleep(2)
-                else:
-                    log_message("Failed to transfer funds from Funding to Trading Account. Will continue but balances may be insufficient.", section="WARNING")
+                # For a unified account, totalEq and availEq give the overall balance.
+                new_total_balance = safe_float(account_details.get('totalEq', '0'))
+                new_avail_balance = safe_float(account_details.get('availEq', '0'))
 
-        # Step 2: Now check Trading Account for balance
-        path_trading = "/api/v5/account/balance"
-        params_trading = {"ccy": CURRENCY}
-        response_trading = okx_request("GET", path_trading, params=params_trading)
-        log_message(f"Trading Account Balance Response: {response_trading}", section="DEBUG")
-
-        if response_trading and response_trading.get('code') == '0':
-            data = response_trading.get('data', [])
-            if data:
-                currency_details = None
-                try:
-                    currency_details = next((item for item in data[0].get('details', []) if item.get('ccy') == CURRENCY), None)
-                except Exception:
-                    currency_details = None
-
-                new_total_balance = 0.0
-                new_avail_balance = 0.0
-
-                if currency_details:
-                    new_total_balance = safe_float(currency_details.get('eq', '0'))
-                    new_avail_balance = safe_float(currency_details.get('availEq', '0'))
-                    log_message(f"Found specific currency details for {CURRENCY}: Total={new_total_balance:.8f}, Available={new_avail_balance:.8f}", section="ACCOUNT")
-                else:
-                    overall = data[0]
-                    new_total_balance = safe_float(overall.get('totalEq', '0'))
-                    new_avail_balance = safe_float(overall.get('availEq', '0'))
-                    if new_total_balance > 0 or new_avail_balance > 0:
-                        log_message("Using overall account equity (totalEq/availEq) as currency-specific details were missing.", section="ACCOUNT")
-                    else:
-                        log_message(f"Currency-specific details for {CURRENCY} missing and overall equity is zero. This suggests no usable trading balance.", section="ERROR")
-                        return False
+                if new_total_balance == 0 and new_avail_balance == 0:
+                    log_message(f"Warning: Both total and available equity are zero for {CURRENCY}.", section="ACCOUNT")
 
                 with account_info_lock:
                     account_balance = new_total_balance
                     available_balance = new_avail_balance
-                    log_message(f"Total Balance: {account_balance:.8f} {CURRENCY}", section="ACCOUNT")
-                    log_message(f"Available Balance: {available_balance:.8f} {CURRENCY}", section="ACCOUNT")
+                    log_message(f"Total Futures Account Equity: {account_balance:.8f} {CURRENCY}", section="ACCOUNT")
+                    log_message(f"Available Futures Account Equity: {available_balance:.8f} {CURRENCY}", section="ACCOUNT")
+
+                if available_balance > 0:
                     return True
+                else:
+                    log_message("No available balance for trading.", section="ERROR")
+                    return False
             else:
                 log_message("OKX Trading Account data missing in response", section="ERROR")
                 return False
         else:
-            log_message(f"Failed to fetch OKX Trading Account info: {response_trading.get('msg') if response_trading else 'No response'}", section="ERROR")
+            log_message(f"Failed to fetch OKX Trading Account info: {response.get('msg') if response else 'No response'}", section="ERROR")
             return False
 
     except Exception as e:
@@ -945,7 +916,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
 
         all_data = []
         max_candles_limit = 100
-        
+
         current_before_ms = None
 
         while True:
@@ -978,16 +949,16 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                         except (ValueError, TypeError, IndexError) as e:
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
-                    
+
                     all_data.extend(parsed_klines)
-                    
+
                     oldest_ts = int(rows[-1][0])
                     current_before_ms = oldest_ts
 
                     if oldest_ts <= start_ts_ms or len(rows) < max_candles_limit:
-                        break 
+                        break
                 else:
-                    break 
+                    break
 
                 sleep(0.3)
             else:
@@ -998,7 +969,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         final_data = final_data.drop_duplicates(subset=['Timestamp'])
         final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
-        
+
         return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
@@ -1115,13 +1086,75 @@ def update_historical_data_from_ws(timeframe_key, klines_ws):
         log_message(f"Exception in update_historical_data_from_ws: {e}", section="ERROR")
 
 # ================================================================================
-# OKX SDK WebSocket Implementation
+# Raw WebSocket Implementation
 # ================================================================================
 
-def on_sdk_message(message):
-    global latest_trade_price, latest_trade_timestamp, bot_startup_complete
+class RawOkxSocketClient:
+    def __init__(self, url, on_message, on_error, on_close, on_open):
+        self.ws = None
+        self.url = url
+        self.on_message = on_message
+        self.on_error = on_error
+        self.on_close = on_close
+        self.on_open = on_open
+        self.is_running = False
+
+    def start(self):
+        self.is_running = True
+        self.ws = websocket.WebSocketApp(
+            self.url,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_open=self.on_open
+        )
+        _thread.start_new_thread(self.ws.run_forever, ())
+
+    def send(self, data):
+        if self.ws:
+            self.ws.send(data)
+
+    def subscribe(self, channels):
+        if self.ws:
+            sub_payload = {
+                "op": "subscribe",
+                "args": channels
+            }
+            self.send(json.dumps(sub_payload))
+
+    def close(self):
+        self.is_running = False
+        if self.ws:
+            self.ws.close()
+
+def get_ws_url():
+    # Per OKX documentation, demo trading uses the production WebSocket endpoint
+    # with `x-simulated-trading: 1` in the REST API calls, which is already handled.
+    return "wss://ws.okx.com:8443/ws/v5/public"
+
+# ================================================================================
+# WebSocket Implementation
+# ================================================================================
+
+def on_websocket_message(ws_app, message):
+    global latest_trade_price, latest_trade_timestamp, bot_startup_complete, subscribed_channels, required_channels_count
     try:
         msg = json.loads(message)
+
+        # Handle event messages (login, subscribe)
+        if 'event' in msg:
+            if msg['event'] == 'subscribe':
+                channel = msg.get('arg', {}).get('channel')
+                instId = msg.get('arg', {}).get('instId')
+                sub_key = f"{channel}:{instId}"
+                if sub_key not in subscribed_channels:
+                    subscribed_channels.add(sub_key)
+                    log_message(f"Subscribed to {sub_key}", section="WS")
+
+                if len(subscribed_channels) == required_channels_count:
+                    log_message("All channels subscribed.", section="WS")
+                    ws_subscriptions_ready.set()
+            return
 
         if 'data' in msg:
             channel = msg.get('arg', {}).get('channel', '')
@@ -1138,7 +1171,7 @@ def on_sdk_message(message):
                     timeframe_key = timeframe_key.replace('H', 'h').lower()
                 elif timeframe_key.endswith('D'):
                     timeframe_key = timeframe_key.replace('D', 'd').lower()
-                
+
                 parsed_klines = [
                     [int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
                     for k in data if len(k) >= 6
@@ -1150,70 +1183,61 @@ def on_sdk_message(message):
 
             elif channel == 'positions' and data:
                 detect_sl_from_position_update(data)
-                
+
     except json.JSONDecodeError:
         pass
     except Exception as e:
-        log_message(f"Exception in on_sdk_message: {e}", "ERROR")
+        log_message(f"Exception in on_websocket_message: {e}", section="ERROR")
 
-def on_sdk_open(ws_client):
-    log_message("OKX WebSocket connection opened.", "WS")
-    
+def on_websocket_open(ws_app):
+    log_message("OKX WebSocket connection opened.", section="WS")
+
     # Subscribe to channels
     okx_timeframe_map = {
         '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
         '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '8h': '8H',
         '12h': '12H', '1d': '1D', '1w': '1W', '1M': '1M'
     }
-    
+
+    global required_channels_count
     channels = [
         {"channel": "trades", "instId": SYMBOL},
-        {"channel": "orders", "instType": "SWAP", "instId": SYMBOL},
-        {"channel": "positions", "instType": "SWAP", "instId": SYMBOL}
     ]
-    
+
     for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
         okx_channel = okx_timeframe_map.get(tf.lower())
         if okx_channel:
             channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
-            
-    ws_client.subscribe(channels)
 
-def on_sdk_login(ws_client):
-    log_message("OKX WebSocket authenticated.", "WS")
-    ws_authenticated.set()
+    required_channels_count = len(channels)
+    ws.subscribe(channels)
 
-def on_sdk_subscribe(ws_client, sub_resp):
-    log_message(f"OKX Subscription OK: {sub_resp}", "WS")
-    ws_subscriptions_ready.set()
+def on_websocket_error(ws_app, error):
+    log_message(f"OKX WebSocket error: {error}", section="ERROR")
 
-def on_sdk_error(ws_client, error):
-    log_message(f"OKX SDK WebSocket error: {error}", "ERROR")
+def on_websocket_close(ws_app, close_status_code, close_msg):
+    log_message("OKX WebSocket closed.", section="SYSTEM")
 
-def on_sdk_close(ws_client):
-    log_message("OKX SDK WebSocket closed.", "SYSTEM")
-
-def initialize_sdk_websocket():
+def initialize_websocket():
+    """
+    Initializes a raw WebSocket connection.
+    """
     global ws
+    ws_url = get_ws_url()
+
     try:
-        domain = "wss://wspap.okx.com:8443" if USE_TESTNET else "wss://ws.okx.com:8443"
-        ws = OkxSocketClient(
-            API_KEY,
-            API_SECRET,
-            API_PASSPHRASE,
-            domain=domain,
-            on_message=on_sdk_message,
-            on_open=on_sdk_open,
-            on_login=on_sdk_login,
-            on_subscribe=on_sdk_subscribe,
-            on_error=on_sdk_error,
-            on_close=on_sdk_close,
+        ws = RawOkxSocketClient(
+            url=ws_url,
+            on_message=on_websocket_message,
+            on_error=on_websocket_error,
+            on_close=on_websocket_close,
+            on_open=on_websocket_open
         )
         ws.start()
-        log_message(f"OKX SDK WebSocket client started on domain: {domain}", "SYSTEM")
+        log_message(f"Raw WebSocket client started on URL: {ws_url}", section="SYSTEM")
         return ws
     except Exception as e:
-        log_message(f"Exception initializing SDK WebSocket: {e}", section="ERROR")
+        log_message(f"Exception initializing raw WebSocket: {e}", section="ERROR")
         return None
 
 # ================================================================================
@@ -2338,7 +2362,7 @@ def main():
             return
 
         log_message("Initializing WebSocket connection...", section="SYSTEM")
-        ws_client = initialize_sdk_websocket()
+        ws_client = initialize_websocket()
         if ws_client is None:
             log_message("Failed to initialize WebSocket. Exiting.", section="CRITICAL_ERROR")
             return
