@@ -1251,15 +1251,17 @@ def initialize_sdk_websocket():
             API_KEY,
             API_SECRET,
             API_PASSPHRASE,
-            on_message=on_sdk_message,
-            on_open=on_sdk_open,
-            on_login=on_sdk_login,
-            on_subscribe=on_sdk_subscribe,
-            on_error=on_sdk_error,
-            on_close=on_sdk_close,
         )
+        # Assign callbacks after initialization
+        ws.on_message = on_sdk_message
+        ws.on_open = on_sdk_open
+        ws.on_login = on_sdk_login
+        ws.on_subscribe = on_sdk_subscribe
+        ws.on_error = on_sdk_error
+        ws.on_close = on_sdk_close
+
         ws.start()
-        log_message("OKX SDK WebSocket client started.", "SYSTEM")
+        log_message("OKX SDK WebSocket client started.", section="SYSTEM")
         return ws
     except Exception as e:
         log_message(f"Exception initializing SDK WebSocket: {e}", section="ERROR")
@@ -1314,7 +1316,7 @@ def initialize_raw_websocket():
             on_open=on_raw_open
         )
         ws.start()
-        log_message(f"Raw WebSocket client started on URL: {ws_url}", "SYSTEM")
+        log_message(f"Raw WebSocket client started on URL: {ws_url}", section="SYSTEM")
         return ws
     except Exception as e:
         log_message(f"Exception initializing raw WebSocket: {e}", section="ERROR")
