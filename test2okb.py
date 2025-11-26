@@ -38,6 +38,8 @@ import threading
 import traceback
 import gc
 from okx import OkxSocketClient
+import websocket
+import _thread
 
 # ================================================================================
 
@@ -945,7 +947,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
 
         all_data = []
         max_candles_limit = 100
-        
+
         current_before_ms = None
 
         while True:
@@ -978,16 +980,16 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                         except (ValueError, TypeError, IndexError) as e:
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
-                    
+
                     all_data.extend(parsed_klines)
-                    
+
                     oldest_ts = int(rows[-1][0])
                     current_before_ms = oldest_ts
 
                     if oldest_ts <= start_ts_ms or len(rows) < max_candles_limit:
-                        break 
+                        break
                 else:
-                    break 
+                    break
 
                 sleep(0.3)
             else:
@@ -998,7 +1000,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         final_data = final_data.drop_duplicates(subset=['Timestamp'])
         final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
-        
+
         return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
@@ -1115,6 +1117,53 @@ def update_historical_data_from_ws(timeframe_key, klines_ws):
         log_message(f"Exception in update_historical_data_from_ws: {e}", section="ERROR")
 
 # ================================================================================
+# Raw WebSocket Implementation
+# ================================================================================
+
+class RawOkxSocketClient:
+    def __init__(self, url, on_message, on_error, on_close, on_open):
+        self.ws = None
+        self.url = url
+        self.on_message = on_message
+        self.on_error = on_error
+        self.on_close = on_close
+        self.on_open = on_open
+        self.is_running = False
+
+    def start(self):
+        self.is_running = True
+        self.ws = websocket.WebSocketApp(
+            self.url,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_open=self.on_open
+        )
+        _thread.start_new_thread(self.ws.run_forever, ())
+
+    def send(self, data):
+        if self.ws:
+            self.ws.send(data)
+
+    def subscribe(self, channels):
+        if self.ws:
+            sub_payload = {
+                "op": "subscribe",
+                "args": channels
+            }
+            self.send(json.dumps(sub_payload))
+
+    def close(self):
+        self.is_running = False
+        if self.ws:
+            self.ws.close()
+
+def get_ws_url():
+    # Per OKX documentation, demo trading uses the production WebSocket endpoint
+    # with `x-simulated-trading: 1` in the REST API calls, which is already handled.
+    return "wss://ws.okx.com:8443/ws/v5/private"
+
+# ================================================================================
 # OKX SDK WebSocket Implementation
 # ================================================================================
 
@@ -1138,7 +1187,7 @@ def on_sdk_message(message):
                     timeframe_key = timeframe_key.replace('H', 'h').lower()
                 elif timeframe_key.endswith('D'):
                     timeframe_key = timeframe_key.replace('D', 'd').lower()
-                
+
                 parsed_klines = [
                     [int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
                     for k in data if len(k) >= 6
@@ -1150,7 +1199,7 @@ def on_sdk_message(message):
 
             elif channel == 'positions' and data:
                 detect_sl_from_position_update(data)
-                
+
     except json.JSONDecodeError:
         pass
     except Exception as e:
@@ -1158,25 +1207,25 @@ def on_sdk_message(message):
 
 def on_sdk_open(ws_client):
     log_message("OKX WebSocket connection opened.", "WS")
-    
+
     # Subscribe to channels
     okx_timeframe_map = {
         '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
         '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '8h': '8H',
         '12h': '12H', '1d': '1D', '1w': '1W', '1M': '1M'
     }
-    
+
     channels = [
         {"channel": "trades", "instId": SYMBOL},
         {"channel": "orders", "instType": "SWAP", "instId": SYMBOL},
         {"channel": "positions", "instType": "SWAP", "instId": SYMBOL}
     ]
-    
+
     for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
         okx_channel = okx_timeframe_map.get(tf.lower())
         if okx_channel:
             channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
-            
+
     ws_client.subscribe(channels)
 
 def on_sdk_login(ws_client):
@@ -1196,12 +1245,12 @@ def on_sdk_close(ws_client):
 def initialize_sdk_websocket():
     global ws
     try:
-        domain = "wss://wspap.okx.com:8443" if USE_TESTNET else "wss://ws.okx.com:8443"
+        # The domain parameter is not supported in the SDK version used.
+        # The SDK now handles the URL endpoint internally.
         ws = OkxSocketClient(
             API_KEY,
             API_SECRET,
             API_PASSPHRASE,
-            domain=domain,
             on_message=on_sdk_message,
             on_open=on_sdk_open,
             on_login=on_sdk_login,
@@ -1210,11 +1259,86 @@ def initialize_sdk_websocket():
             on_close=on_sdk_close,
         )
         ws.start()
-        log_message(f"OKX SDK WebSocket client started on domain: {domain}", "SYSTEM")
+        log_message("OKX SDK WebSocket client started.", "SYSTEM")
         return ws
     except Exception as e:
         log_message(f"Exception initializing SDK WebSocket: {e}", section="ERROR")
         return None
+
+def initialize_raw_websocket():
+    """
+    Initializes a raw WebSocket connection using the websocket-client library.
+    """
+    global ws
+    ws_url = get_ws_url()
+
+    def on_raw_open(ws_app):
+        # Authentication is required for private channels
+        timestamp = str(time())
+        method = 'GET'
+        request_path = '/users/self/verify'
+        message = timestamp + method + request_path
+
+        mac = hmac.new(bytes(API_SECRET, encoding='utf-8'), bytes(message, encoding='utf-8'), digestmod='sha256')
+        d = mac.digest()
+        sign = base64.b64encode(d)
+
+        login_payload = {
+            "op": "login",
+            "args": [{
+                "apiKey": API_KEY,
+                "passphrase": API_PASSPHRASE,
+                "timestamp": timestamp,
+                "sign": sign.decode('utf-8')
+            }]
+        }
+        ws_app.send(json.dumps(login_payload))
+        on_sdk_open(ws)
+
+    def on_raw_message(ws_app, message):
+        # Re-use the existing message handler
+        on_sdk_message(message)
+
+    def on_raw_error(ws_app, error):
+        on_sdk_error(ws, error)
+
+    def on_raw_close(ws_app, close_status_code, close_msg):
+        on_sdk_close(ws)
+
+    try:
+        ws = RawOkxSocketClient(
+            url=ws_url,
+            on_message=on_raw_message,
+            on_error=on_raw_error,
+            on_close=on_raw_close,
+            on_open=on_raw_open
+        )
+        ws.start()
+        log_message(f"Raw WebSocket client started on URL: {ws_url}", "SYSTEM")
+        return ws
+    except Exception as e:
+        log_message(f"Exception initializing raw WebSocket: {e}", section="ERROR")
+        return None
+
+def initialize_websocket():
+    """
+    Initializes the WebSocket connection.
+    Tries the SDK first, and falls back to a raw WebSocket if it fails.
+    """
+    log_message("Attempting to connect via OKX SDK...", "WS")
+    sdk_ws = initialize_sdk_websocket()
+    if sdk_ws:
+        log_message("✓ SDK WebSocket connection successful.", "WS")
+        return sdk_ws
+
+    log_message("SDK connection failed, falling back to raw WebSocket.", "WS")
+    raw_ws = initialize_raw_websocket()
+    if raw_ws:
+        log_message("✓ Raw WebSocket connection successful.", "WS")
+        return raw_ws
+
+    log_message("✗ All WebSocket connection methods failed.", "CRITICAL_ERROR")
+    return None
 
 # ================================================================================
 
@@ -2338,7 +2462,7 @@ def main():
             return
 
         log_message("Initializing WebSocket connection...", section="SYSTEM")
-        ws_client = initialize_sdk_websocket()
+        ws_client = initialize_websocket()
         if ws_client is None:
             log_message("Failed to initialize WebSocket. Exiting.", section="CRITICAL_ERROR")
             return
