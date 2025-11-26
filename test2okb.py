@@ -37,7 +37,8 @@ from time import time, sleep
 import threading
 import traceback
 import gc
-from okx import OkxSocketClient
+import websocket
+import _thread
 
 # ================================================================================
 
@@ -1115,13 +1116,72 @@ def update_historical_data_from_ws(timeframe_key, klines_ws):
         log_message(f"Exception in update_historical_data_from_ws: {e}", section="ERROR")
 
 # ================================================================================
-# OKX SDK WebSocket Implementation
+# Raw WebSocket Implementation
 # ================================================================================
 
-def on_sdk_message(message):
+class RawOkxSocketClient:
+    def __init__(self, url, on_message, on_error, on_close, on_open):
+        self.ws = None
+        self.url = url
+        self.on_message = on_message
+        self.on_error = on_error
+        self.on_close = on_close
+        self.on_open = on_open
+        self.is_running = False
+
+    def start(self):
+        self.is_running = True
+        self.ws = websocket.WebSocketApp(
+            self.url,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_open=self.on_open
+        )
+        _thread.start_new_thread(self.ws.run_forever, ())
+
+    def send(self, data):
+        if self.ws:
+            self.ws.send(data)
+
+    def subscribe(self, channels):
+        if self.ws:
+            sub_payload = {
+                "op": "subscribe",
+                "args": channels
+            }
+            self.send(json.dumps(sub_payload))
+
+    def close(self):
+        self.is_running = False
+        if self.ws:
+            self.ws.close()
+
+def get_ws_url():
+    # Per OKX documentation, demo trading uses the production WebSocket endpoint
+    # with `x-simulated-trading: 1` in the REST API calls, which is already handled.
+    return "wss://ws.okx.com:8443/ws/v5/public"
+
+# ================================================================================
+# WebSocket Implementation
+# ================================================================================
+
+def on_websocket_message(ws_app, message):
     global latest_trade_price, latest_trade_timestamp, bot_startup_complete
     try:
         msg = json.loads(message)
+
+        # Handle event messages (login, subscribe)
+        if 'event' in msg:
+            if msg['event'] == 'login' and msg.get('code') == '0':
+                log_message("WebSocket authenticated.", section="WS")
+                ws_authenticated.set()
+            elif msg['event'] == 'subscribe':
+                log_message(f"Subscription response: {msg}", section="WS")
+                # This is a simplified check. A robust implementation would
+                # track each channel subscription individually.
+                ws_subscriptions_ready.set()
+            return
 
         if 'data' in msg:
             channel = msg.get('arg', {}).get('channel', '')
@@ -1154,10 +1214,10 @@ def on_sdk_message(message):
     except json.JSONDecodeError:
         pass
     except Exception as e:
-        log_message(f"Exception in on_sdk_message: {e}", "ERROR")
+        log_message(f"Exception in on_websocket_message: {e}", section="ERROR")
 
-def on_sdk_open(ws_client):
-    log_message("OKX WebSocket connection opened.", "WS")
+def on_websocket_open(ws_app):
+    log_message("OKX WebSocket connection opened.", section="WS")
     
     # Subscribe to channels
     okx_timeframe_map = {
@@ -1168,8 +1228,6 @@ def on_sdk_open(ws_client):
     
     channels = [
         {"channel": "trades", "instId": SYMBOL},
-        {"channel": "orders", "instType": "SWAP", "instId": SYMBOL},
-        {"channel": "positions", "instType": "SWAP", "instId": SYMBOL}
     ]
     
     for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
@@ -1177,43 +1235,34 @@ def on_sdk_open(ws_client):
         if okx_channel:
             channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
             
-    ws_client.subscribe(channels)
+    ws.subscribe(channels)
 
-def on_sdk_login(ws_client):
-    log_message("OKX WebSocket authenticated.", "WS")
-    ws_authenticated.set()
+def on_websocket_error(ws_app, error):
+    log_message(f"OKX WebSocket error: {error}", section="ERROR")
 
-def on_sdk_subscribe(ws_client, sub_resp):
-    log_message(f"OKX Subscription OK: {sub_resp}", "WS")
-    ws_subscriptions_ready.set()
+def on_websocket_close(ws_app, close_status_code, close_msg):
+    log_message("OKX WebSocket closed.", section="SYSTEM")
 
-def on_sdk_error(ws_client, error):
-    log_message(f"OKX SDK WebSocket error: {error}", "ERROR")
-
-def on_sdk_close(ws_client):
-    log_message("OKX SDK WebSocket closed.", "SYSTEM")
-
-def initialize_sdk_websocket():
+def initialize_websocket():
+    """
+    Initializes a raw WebSocket connection.
+    """
     global ws
+    ws_url = get_ws_url()
+    
     try:
-        domain = "wss://wspap.okx.com:8443" if USE_TESTNET else "wss://ws.okx.com:8443"
-        ws = OkxSocketClient(
-            API_KEY,
-            API_SECRET,
-            API_PASSPHRASE,
-            domain=domain,
-            on_message=on_sdk_message,
-            on_open=on_sdk_open,
-            on_login=on_sdk_login,
-            on_subscribe=on_sdk_subscribe,
-            on_error=on_sdk_error,
-            on_close=on_sdk_close,
+        ws = RawOkxSocketClient(
+            url=ws_url,
+            on_message=on_websocket_message,
+            on_error=on_websocket_error,
+            on_close=on_websocket_close,
+            on_open=on_websocket_open
         )
         ws.start()
-        log_message(f"OKX SDK WebSocket client started on domain: {domain}", "SYSTEM")
+        log_message(f"Raw WebSocket client started on URL: {ws_url}", section="SYSTEM")
         return ws
     except Exception as e:
-        log_message(f"Exception initializing SDK WebSocket: {e}", section="ERROR")
+        log_message(f"Exception initializing raw WebSocket: {e}", section="ERROR")
         return None
 
 # ================================================================================
@@ -2338,7 +2387,7 @@ def main():
             return
 
         log_message("Initializing WebSocket connection...", section="SYSTEM")
-        ws_client = initialize_sdk_websocket()
+        ws_client = initialize_websocket()
         if ws_client is None:
             log_message("Failed to initialize WebSocket. Exiting.", section="CRITICAL_ERROR")
             return
