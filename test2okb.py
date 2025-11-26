@@ -30,7 +30,6 @@ import hmac
 import base64
 import json
 import requests
-import websocket
 import pandas as pd
 import ta
 import numpy as np
@@ -38,6 +37,7 @@ from time import time, sleep
 import threading
 import traceback
 import gc
+from okx import OkxSocketClient
 
 # ================================================================================
 
@@ -83,13 +83,13 @@ API_KEY_TESTNET = "YOUR_OKX_TESTNET_API_KEY"
 API_SECRET_TESTNET = "YOUR_OKX_TESTNET_API_SECRET"
 API_PASSPHRASE_TESTNET = "YOUR_OKX_TESTNET_API_PASSPHRASE"
 REST_API_BASE_URL_TESTNET = "https://www.okx.com"
-WEBSOCKET_URL_PRIVATE_TESTNET = "wss://ws.okx.com:8443/ws/v5/private"
+
 
 API_KEY_LIVE = "2b38b2de-2369-4898-9c03-c5b34a86c963"
 API_SECRET_LIVE = "4F4B909E7BE28C53F03FEEDFF924B67E"
 API_PASSPHRASE_LIVE = "Cosmos1&&"
 REST_API_BASE_URL_LIVE = "https://www.okx.com"
-WEBSOCKET_URL_PRIVATE_LIVE = "wss://ws.okx.com:8443/ws/v5/private"
+
 
 # Active Configuration
 USE_TESTNET = False  # True uses testnet placeholders above; set False to use live keys
@@ -98,14 +98,12 @@ if USE_TESTNET:
     API_SECRET = API_SECRET_TESTNET
     API_PASSPHRASE = API_PASSPHRASE_TESTNET
     REST_API_BASE_URL = REST_API_BASE_URL_TESTNET
-    WEBSOCKET_URL_PRIVATE = WEBSOCKET_URL_PRIVATE_TESTNET
     OKX_SIMULATED_TRADING_HEADER = {'x-simulated-trading': '1'}
 else:
     API_KEY = API_KEY_LIVE
     API_SECRET = API_SECRET_LIVE
     API_PASSPHRASE = API_PASSPHRASE_LIVE
     REST_API_BASE_URL = REST_API_BASE_URL_LIVE
-    WEBSOCKET_URL_PRIVATE = WEBSOCKET_URL_PRIVATE_LIVE
     OKX_SIMULATED_TRADING_HEADER = {}
 
 # ================================================================================
@@ -946,23 +944,26 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         all_data = []
-        max_candles_limit = 300
-
-        current_before_ms = end_ts_ms
+        max_candles_limit = 100
+        
+        current_before_ms = None
 
         while True:
             params = {
                 "instId": symbol,
                 "bar": okx_timeframe,
-                "before": str(current_before_ms),
                 "limit": str(max_candles_limit)
             }
+            if current_before_ms:
+                params["before"] = str(current_before_ms)
 
             response = okx_request("GET", path, params=params)
+            log_message(f"OKX history API response for {timeframe}: {response}", section="DEBUG")
 
             if response and response.get('code') == '0':
                 rows = response.get('data', [])
                 if rows:
+                    log_message(f"Fetched {len(rows)} candles for {timeframe}", section="DATA")
                     parsed_klines = []
                     for kline in rows:
                         try:
@@ -977,22 +978,28 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                         except (ValueError, TypeError, IndexError) as e:
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
+                    
+                    all_data.extend(parsed_klines)
+                    
+                    oldest_ts = int(rows[-1][0])
+                    current_before_ms = oldest_ts
 
-                    all_data.extend(parsed_klines[::-1])
-                    current_before_ms = int(rows[-1][0]) - 1
-
-                    if int(rows[-1][0]) <= start_ts_ms or len(rows) < max_candles_limit:
-                        break
+                    if oldest_ts <= start_ts_ms or len(rows) < max_candles_limit:
+                        break 
                 else:
-                    break
+                    break 
 
                 sleep(0.3)
             else:
                 log_message(f"Error fetching OKX klines: {response}", section="ERROR")
                 return []
 
-        final_data = [kline for kline in all_data if start_ts_ms <= kline[0] <= end_ts_ms]
-        return final_data
+        # Filter data to be within the requested range and remove duplicates
+        final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        final_data = final_data.drop_duplicates(subset=['Timestamp'])
+        final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
+        
+        return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
         return []
@@ -1108,241 +1115,106 @@ def update_historical_data_from_ws(timeframe_key, klines_ws):
         log_message(f"Exception in update_historical_data_from_ws: {e}", section="ERROR")
 
 # ================================================================================
+# OKX SDK WebSocket Implementation
+# ================================================================================
 
-def on_message(ws_app, message):
+def on_sdk_message(message):
     global latest_trade_price, latest_trade_timestamp, bot_startup_complete
-
     try:
         msg = json.loads(message)
 
-        if msg.get('event') == 'login':
-            if msg.get('code') == '0':
-                log_message(" OKX WebSocket authenticated", section="WS")
-                ws_authenticated.set()
-            else:
-                log_message(f" OKX WebSocket login failed: code={msg.get('code')}, msg={msg.get('msg')}", section="ERROR")
-        elif msg.get('event') == 'subscribe':
-            if msg.get('code') == '0':
-                log_message(f" OKX Subscription OK: channel={msg.get('arg', {}).get('channel')}", section="WS")
-                ws_subscriptions_ready.set()
-            else:
-                log_message(f" OKX Subscription failed: channel={msg.get('arg', {}).get('channel')}, code={msg.get('code')}, msg={msg.get('msg')}", section="ERROR")
-        elif msg.get('event') == 'error':
-            log_message(f" OKX WebSocket error event: code={msg.get('code')}, msg={msg.get('msg')}", section="ERROR")
-
-        elif 'data' in msg:
+        if 'data' in msg:
             channel = msg.get('arg', {}).get('channel', '')
+            data = msg.get('data', [])
 
-            if channel == 'trades':
-                trades = msg['data']
-                if trades:
-                    with trade_data_lock:
-                        latest_trade_timestamp = int(trades[-1].get('ts'))
-                        latest_trade_price = safe_float(trades[-1].get('px'))
+            if channel == 'trades' and data:
+                with trade_data_lock:
+                    latest_trade_timestamp = int(data[-1].get('ts'))
+                    latest_trade_price = safe_float(data[-1].get('px'))
 
-            elif channel.startswith('candle'):
-                klines = msg['data']
-                if klines:
-                    timeframe_key = channel.replace('candle', '')
-                    if timeframe_key.endswith('H'):
-                        timeframe_key = timeframe_key.replace('H', 'h').lower()
-                    elif timeframe_key.endswith('D'):
-                        timeframe_key = timeframe_key.replace('D', 'd').lower()
+            elif channel.startswith('candle') and data:
+                timeframe_key = channel.replace('candle', '')
+                if timeframe_key.endswith('H'):
+                    timeframe_key = timeframe_key.replace('H', 'h').lower()
+                elif timeframe_key.endswith('D'):
+                    timeframe_key = timeframe_key.replace('D', 'd').lower()
+                
+                parsed_klines = [
+                    [int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
+                    for k in data if len(k) >= 6
+                ]
+                update_historical_data_from_ws(timeframe_key, parsed_klines)
 
-                    parsed_klines = []
-                    for kline in klines:
-                        if len(kline) >= 6:
-                            parsed_klines.append([
-                                int(kline[0]),
-                                float(kline[1]),
-                                float(kline[2]),
-                                float(kline[3]),
-                                float(kline[4]),
-                                float(kline[5])
-                            ])
+            elif channel == 'orders' and bot_startup_complete and data:
+                handle_order_update(data)
 
-                    update_historical_data_from_ws(timeframe_key, parsed_klines)
-
-            elif channel == 'orders':
-                if not bot_startup_complete:
-                    return
-                orders = msg['data']
-                if isinstance(orders, list):
-                    handle_order_update(orders)
-                else:
-                    handle_order_update([orders])
-
-            elif channel == 'positions':
-                positions = msg['data']
-                if isinstance(positions, list):
-                    detect_sl_from_position_update(positions)
-                else:
-                    detect_sl_from_position_update([positions])
-
-            elif channel == 'account':
-                pass
-
+            elif channel == 'positions' and data:
+                detect_sl_from_position_update(data)
+                
     except json.JSONDecodeError:
         pass
     except Exception as e:
-        log_message(f"Exception in on_message (OKX): {e}", section="ERROR")
-        import traceback
-        traceback.print_exc()
+        log_message(f"Exception in on_sdk_message: {e}", "ERROR")
 
-# ================================================================================
+def on_sdk_open(ws_client):
+    log_message("OKX WebSocket connection opened.", "WS")
+    
+    # Subscribe to channels
+    okx_timeframe_map = {
+        '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
+        '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '8h': '8H',
+        '12h': '12H', '1d': '1D', '1w': '1W', '1M': '1M'
+    }
+    
+    channels = [
+        {"channel": "trades", "instId": SYMBOL},
+        {"channel": "orders", "instType": "SWAP", "instId": SYMBOL},
+        {"channel": "positions", "instType": "SWAP", "instId": SYMBOL}
+    ]
+    
+    for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
+        okx_channel = okx_timeframe_map.get(tf.lower())
+        if okx_channel:
+            channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
+            
+    ws_client.subscribe(channels)
 
-def send_okx_ws_auth(ws_instance):
-    """
-    Sends authentication message to OKX WebSocket using same signing as REST:
-    timestamp (ISO8601 ms) + method('GET') + '/users/self/verify' + body('').
-    Signature is Base64-encoded HMAC-SHA256.
-    """
-    try:
-        adjusted_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(milliseconds=server_time_offset)
-        timestamp_s = adjusted_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+def on_sdk_login(ws_client):
+    log_message("OKX WebSocket authenticated.", "WS")
+    ws_authenticated.set()
 
-        sign = generate_okx_signature(timestamp_s, 'GET', '/users/self/verify', '')
+def on_sdk_subscribe(ws_client, sub_resp):
+    log_message(f"OKX Subscription OK: {sub_resp}", "WS")
+    ws_subscriptions_ready.set()
 
-        auth_msg = {
-            "op": "login",
-            "args": [{
-                "apiKey": API_KEY,
-                "passphrase": API_PASSPHRASE,
-                "timestamp": timestamp_s,
-                "sign": sign
-            }]
-        }
+def on_sdk_error(ws_client, error):
+    log_message(f"OKX SDK WebSocket error: {error}", "ERROR")
 
-        log_message(f"Sending OKX WebSocket authentication...", section="WS")
-        ws_instance.send(json.dumps(auth_msg))
+def on_sdk_close(ws_client):
+    log_message("OKX SDK WebSocket closed.", "SYSTEM")
 
-        if ws_authenticated.wait(timeout=10):
-            log_message(" OKX WebSocket authenticated", section="WS")
-            return True
-        else:
-            log_message(" OKX WebSocket authentication timeout", section="ERROR")
-            return False
-    except Exception as e:
-        log_message(f"Error sending OKX WS auth: {e}", section="ERROR")
-        return False
-
-def on_open(ws_instance):
-    try:
-        log_message("=" * 80, section="WS")
-        log_message("OKX WebSocket connection opened", section="WS")
-        log_message("=" * 80, section="WS")
-
-        ws_authenticated.clear()
-        ws_subscriptions_ready.clear()
-
-        log_message("Step 1: Authenticating...", section="WS")
-        if not send_okx_ws_auth(ws_instance):
-            log_message("Failed to authenticate, retrying...", section="ERROR")
-            sleep(2)
-            send_okx_ws_auth(ws_instance)
-
-        sleep(2)
-
-        log_message("Step 2: Subscribing to OKX trades...", section="WS")
-        trade_sub_args = [{"channel": "trades", "instId": SYMBOL}]
-        ws_instance.send(json.dumps({"op": "subscribe", "args": trade_sub_args, "id": 1}))
-        sleep(0.5)
-
-        log_message("Step 3: Subscribing to OKX orders and positions...", section="WS")
-        private_sub_args = [
-            {"channel": "orders", "instType": "SWAP", "instId": SYMBOL},
-            {"channel": "positions", "instType": "SWAP", "instId": SYMBOL}
-        ]
-        ws_instance.send(json.dumps({"op": "subscribe", "args": private_sub_args, "id": 100}))
-        sleep(0.5)
-
-        subscribed_intervals = set()
-        tf_id = 200
-
-        okx_timeframe_map = {
-            '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
-            '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '8h': '8H',
-            '12h': '12H', '1d': '1D', '1w': '1W', '1M': '1M'
-        }
-
-        for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
-            okx_channel = okx_timeframe_map.get(tf.lower())
-            if okx_channel:
-                channel_name = f"candle{okx_channel}"
-                if channel_name not in subscribed_intervals:
-                    kline_sub_args = [{"channel": channel_name, "instId": SYMBOL}]
-                    log_message(f"Step {tf_id-196}: Subscribing to {tf} OKX klines...", section="WS")
-                    ws_instance.send(json.dumps({"op": "subscribe", "args": kline_sub_args, "id": tf_id}))
-                    subscribed_intervals.add(channel_name)
-                    tf_id += 1
-                    sleep(0.5)
-
-        ws_subscriptions_ready.set()
-
-        log_message("=" * 80, section="WS")
-        log_message(" All OKX WebSocket subscriptions complete", section="WS")
-        log_message(" Position updates are now monitored for SL detection", section="WS")
-        log_message("=" * 80, section="WS")
-    except Exception as e:
-        log_message(f"Error in on_open: {e}", section="ERROR")
-        import traceback
-        traceback.print_exc()
-
-def on_error(ws_app, error):
-    log_message(f"WebSocket error: {error}", section="ERROR")
-    if not shutdown_flag.is_set():
-        sleep(5)
-        try:
-            initialize_websocket()
-        except Exception:
-            pass
-
-def on_close(ws_app, status_code, msg):
-    log_message(f"WebSocket closed: Status {status_code}", section="SYSTEM")
-    if not shutdown_flag.is_set():
-        sleep(5)
-        try:
-            initialize_websocket()
-        except Exception:
-            pass
-
-def initialize_websocket():
+def initialize_sdk_websocket():
     global ws
     try:
-        if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
-            try:
-                ws.close()
-                sleep(2)
-            except Exception:
-                pass
-
-        ws = websocket.WebSocketApp(
-            WEBSOCKET_URL_PRIVATE,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
+        domain = "wss://wspap.okx.com:8443" if USE_TESTNET else "wss://ws.okx.com:8443"
+        ws = OkxSocketClient(
+            API_KEY,
+            API_SECRET,
+            API_PASSPHRASE,
+            domain=domain,
+            on_message=on_sdk_message,
+            on_open=on_sdk_open,
+            on_login=on_sdk_login,
+            on_subscribe=on_sdk_subscribe,
+            on_error=on_sdk_error,
+            on_close=on_sdk_close,
         )
-
-        wst = threading.Thread(target=ws.run_forever, name="OKX_WS", daemon=True)
-        wst.start()
-        log_message("OKX WebSocket thread started", section="SYSTEM")
-
+        ws.start()
+        log_message(f"OKX SDK WebSocket client started on domain: {domain}", "SYSTEM")
         return ws
     except Exception as e:
-        log_message(f"Exception in initialize_websocket: {e}", section="ERROR")
+        log_message(f"Exception initializing SDK WebSocket: {e}", section="ERROR")
         return None
-
-def send_heartbeat():
-    global ws
-    while not shutdown_flag.is_set():
-        sleep(30)
-        try:
-            if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
-                ping_msg = json.dumps({"op": "ping"})
-                ws.send(ping_msg)
-        except Exception:
-            pass
 
 # ================================================================================
 
@@ -2454,7 +2326,8 @@ def main():
             return
 
         log_message("Fetching initial historical data...", section="SYSTEM")
-        today = datetime.datetime.now(datetime.timezone.utc).date()
+        adjusted_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(milliseconds=server_time_offset)
+        today = adjusted_now.date()
         start_date = today - datetime.timedelta(days=HISTORICAL_DATA_MONTHS * 30)
 
         if not fetch_initial_historical_data(SYMBOL, TIMEFRAME_CPR, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')):
@@ -2465,13 +2338,10 @@ def main():
             return
 
         log_message("Initializing WebSocket connection...", section="SYSTEM")
-        ws_client = initialize_websocket()
+        ws_client = initialize_sdk_websocket()
         if ws_client is None:
             log_message("Failed to initialize WebSocket. Exiting.", section="CRITICAL_ERROR")
             return
-
-        heartbeat_thread = threading.Thread(target=send_heartbeat, name="Heartbeat", daemon=True)
-        heartbeat_thread.start()
 
         log_message("Waiting for WebSocket subscriptions to be ready...", section="SYSTEM")
         if not ws_subscriptions_ready.wait(timeout=20):
