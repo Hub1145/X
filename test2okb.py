@@ -1203,10 +1203,10 @@ def on_sdk_message(message):
     except json.JSONDecodeError:
         pass
     except Exception as e:
-        log_message(f"Exception in on_sdk_message: {e}", "ERROR")
+        log_message(f"Exception in on_sdk_message: {e}", section="ERROR")
 
 def on_sdk_open(ws_client):
-    log_message("OKX WebSocket connection opened.", "WS")
+    log_message("OKX WebSocket connection opened.", section="WS")
 
     # Subscribe to channels
     okx_timeframe_map = {
@@ -1229,18 +1229,18 @@ def on_sdk_open(ws_client):
     ws_client.subscribe(channels)
 
 def on_sdk_login(ws_client):
-    log_message("OKX WebSocket authenticated.", "WS")
+    log_message("OKX WebSocket authenticated.", section="WS")
     ws_authenticated.set()
 
 def on_sdk_subscribe(ws_client, sub_resp):
-    log_message(f"OKX Subscription OK: {sub_resp}", "WS")
+    log_message(f"OKX Subscription OK: {sub_resp}", section="WS")
     ws_subscriptions_ready.set()
 
 def on_sdk_error(ws_client, error):
-    log_message(f"OKX SDK WebSocket error: {error}", "ERROR")
+    log_message(f"OKX SDK WebSocket error: {error}", section="ERROR")
 
 def on_sdk_close(ws_client):
-    log_message("OKX SDK WebSocket closed.", "SYSTEM")
+    log_message("OKX SDK WebSocket closed.", section="SYSTEM")
 
 def initialize_sdk_websocket():
     global ws
@@ -1325,19 +1325,19 @@ def initialize_websocket():
     Initializes the WebSocket connection.
     Tries the SDK first, and falls back to a raw WebSocket if it fails.
     """
-    log_message("Attempting to connect via OKX SDK...", "WS")
+    log_message("Attempting to connect via OKX SDK...", section="WS")
     sdk_ws = initialize_sdk_websocket()
     if sdk_ws:
-        log_message("✓ SDK WebSocket connection successful.", "WS")
+        log_message("✓ SDK WebSocket connection successful.", section="WS")
         return sdk_ws
 
-    log_message("SDK connection failed, falling back to raw WebSocket.", "WS")
+    log_message("SDK connection failed, falling back to raw WebSocket.", section="WS")
     raw_ws = initialize_raw_websocket()
     if raw_ws:
-        log_message("✓ Raw WebSocket connection successful.", "WS")
+        log_message("✓ Raw WebSocket connection successful.", section="WS")
         return raw_ws
 
-    log_message("✗ All WebSocket connection methods failed.", "CRITICAL_ERROR")
+    log_message("✗ All WebSocket connection methods failed.", section="CRITICAL_ERROR")
     return None
 
 # ================================================================================
