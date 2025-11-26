@@ -946,7 +946,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         all_data = []
-        max_candles_limit = 300
+        max_candles_limit = 100
 
         current_before_ms = end_ts_ms
 
@@ -963,6 +963,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
             if response and response.get('code') == '0':
                 rows = response.get('data', [])
                 if rows:
+                    log_message(f"Fetched {len(rows)} candles for {timeframe}", section="DATA")
                     parsed_klines = []
                     for kline in rows:
                         try:
