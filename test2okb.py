@@ -946,23 +946,26 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         all_data = []
-        max_candles_limit = 300
+        max_candles_limit = 100
 
-        current_before_ms = end_ts_ms
+        current_before_ms = None
 
         while True:
             params = {
                 "instId": symbol,
                 "bar": okx_timeframe,
-                "before": str(current_before_ms),
                 "limit": str(max_candles_limit)
             }
+            if current_before_ms:
+                params["before"] = str(current_before_ms)
 
             response = okx_request("GET", path, params=params)
+            log_message(f"OKX history API response for {timeframe}: {response}", section="DEBUG")
 
             if response and response.get('code') == '0':
                 rows = response.get('data', [])
                 if rows:
+                    log_message(f"Fetched {len(rows)} candles for {timeframe}", section="DATA")
                     parsed_klines = []
                     for kline in rows:
                         try:
@@ -978,10 +981,12 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
 
-                    all_data.extend(parsed_klines[::-1])
-                    current_before_ms = int(rows[-1][0]) - 1
+                    all_data.extend(parsed_klines)
 
-                    if int(rows[-1][0]) <= start_ts_ms or len(rows) < max_candles_limit:
+                    oldest_ts = int(rows[-1][0])
+                    current_before_ms = oldest_ts
+
+                    if oldest_ts <= start_ts_ms or len(rows) < max_candles_limit:
                         break
                 else:
                     break
@@ -991,8 +996,12 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                 log_message(f"Error fetching OKX klines: {response}", section="ERROR")
                 return []
 
-        final_data = [kline for kline in all_data if start_ts_ms <= kline[0] <= end_ts_ms]
-        return final_data
+        # Filter data to be within the requested range and remove duplicates
+        final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        final_data = final_data.drop_duplicates(subset=['Timestamp'])
+        final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
+
+        return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
         return []
@@ -2454,7 +2463,8 @@ def main():
             return
 
         log_message("Fetching initial historical data...", section="SYSTEM")
-        today = datetime.datetime.now(datetime.timezone.utc).date()
+        adjusted_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(milliseconds=server_time_offset)
+        today = adjusted_now.date()
         start_date = today - datetime.timedelta(days=HISTORICAL_DATA_MONTHS * 30)
 
         if not fetch_initial_historical_data(SYMBOL, TIMEFRAME_CPR, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')):
