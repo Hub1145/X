@@ -37,7 +37,6 @@ from time import time, sleep
 import threading
 import traceback
 import gc
-from okx import OkxSocketClient
 import websocket
 import _thread
 
@@ -1164,13 +1163,25 @@ def get_ws_url():
     return "wss://ws.okx.com:8443/ws/v5/private"
 
 # ================================================================================
-# OKX SDK WebSocket Implementation
+# WebSocket Implementation
 # ================================================================================
 
-def on_sdk_message(message):
+def on_websocket_message(ws_app, message):
     global latest_trade_price, latest_trade_timestamp, bot_startup_complete
     try:
         msg = json.loads(message)
+
+        # Handle event messages (login, subscribe)
+        if 'event' in msg:
+            if msg['event'] == 'login' and msg.get('code') == '0':
+                log_message("WebSocket authenticated.", section="WS")
+                ws_authenticated.set()
+            elif msg['event'] == 'subscribe':
+                log_message(f"Subscription response: {msg}", section="WS")
+                # This is a simplified check. A robust implementation would
+                # track each channel subscription individually.
+                ws_subscriptions_ready.set()
+            return
 
         if 'data' in msg:
             channel = msg.get('arg', {}).get('channel', '')
@@ -1203,10 +1214,31 @@ def on_sdk_message(message):
     except json.JSONDecodeError:
         pass
     except Exception as e:
-        log_message(f"Exception in on_sdk_message: {e}", section="ERROR")
+        log_message(f"Exception in on_websocket_message: {e}", section="ERROR")
 
-def on_sdk_open(ws_client):
+def on_websocket_open(ws_app):
     log_message("OKX WebSocket connection opened.", section="WS")
+
+    # Authentication is required for private channels
+    timestamp = str(time())
+    method = 'GET'
+    request_path = '/users/self/verify'
+    message = timestamp + method + request_path
+
+    mac = hmac.new(bytes(API_SECRET, encoding='utf-8'), bytes(message, encoding='utf-8'), digestmod='sha256')
+    d = mac.digest()
+    sign = base64.b64encode(d)
+
+    login_payload = {
+        "op": "login",
+        "args": [{
+            "apiKey": API_KEY,
+            "passphrase": API_PASSPHRASE,
+            "timestamp": timestamp,
+            "sign": sign.decode('utf-8')
+        }]
+    }
+    ws_app.send(json.dumps(login_payload))
 
     # Subscribe to channels
     okx_timeframe_map = {
@@ -1226,94 +1258,28 @@ def on_sdk_open(ws_client):
         if okx_channel:
             channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
 
-    ws_client.subscribe(channels)
+    ws.subscribe(channels)
 
-def on_sdk_login(ws_client):
-    log_message("OKX WebSocket authenticated.", section="WS")
-    ws_authenticated.set()
+def on_websocket_error(ws_app, error):
+    log_message(f"OKX WebSocket error: {error}", section="ERROR")
 
-def on_sdk_subscribe(ws_client, sub_resp):
-    log_message(f"OKX Subscription OK: {sub_resp}", section="WS")
-    ws_subscriptions_ready.set()
+def on_websocket_close(ws_app, close_status_code, close_msg):
+    log_message("OKX WebSocket closed.", section="SYSTEM")
 
-def on_sdk_error(ws_client, error):
-    log_message(f"OKX SDK WebSocket error: {error}", section="ERROR")
-
-def on_sdk_close(ws_client):
-    log_message("OKX SDK WebSocket closed.", section="SYSTEM")
-
-def initialize_sdk_websocket():
-    global ws
-    try:
-        # The domain parameter is not supported in the SDK version used.
-        # The SDK now handles the URL endpoint internally.
-        ws = OkxSocketClient(
-            API_KEY,
-            API_SECRET,
-            API_PASSPHRASE,
-        )
-        # Assign callbacks after initialization
-        ws.on_message = on_sdk_message
-        ws.on_open = on_sdk_open
-        ws.on_login = on_sdk_login
-        ws.on_subscribe = on_sdk_subscribe
-        ws.on_error = on_sdk_error
-        ws.on_close = on_sdk_close
-
-        ws.start()
-        log_message("OKX SDK WebSocket client started.", section="SYSTEM")
-        return ws
-    except Exception as e:
-        log_message(f"Exception initializing SDK WebSocket: {e}", section="ERROR")
-        return None
-
-def initialize_raw_websocket():
+def initialize_websocket():
     """
-    Initializes a raw WebSocket connection using the websocket-client library.
+    Initializes a raw WebSocket connection.
     """
     global ws
     ws_url = get_ws_url()
 
-    def on_raw_open(ws_app):
-        # Authentication is required for private channels
-        timestamp = str(time())
-        method = 'GET'
-        request_path = '/users/self/verify'
-        message = timestamp + method + request_path
-
-        mac = hmac.new(bytes(API_SECRET, encoding='utf-8'), bytes(message, encoding='utf-8'), digestmod='sha256')
-        d = mac.digest()
-        sign = base64.b64encode(d)
-
-        login_payload = {
-            "op": "login",
-            "args": [{
-                "apiKey": API_KEY,
-                "passphrase": API_PASSPHRASE,
-                "timestamp": timestamp,
-                "sign": sign.decode('utf-8')
-            }]
-        }
-        ws_app.send(json.dumps(login_payload))
-        on_sdk_open(ws)
-
-    def on_raw_message(ws_app, message):
-        # Re-use the existing message handler
-        on_sdk_message(message)
-
-    def on_raw_error(ws_app, error):
-        on_sdk_error(ws, error)
-
-    def on_raw_close(ws_app, close_status_code, close_msg):
-        on_sdk_close(ws)
-
     try:
         ws = RawOkxSocketClient(
             url=ws_url,
-            on_message=on_raw_message,
-            on_error=on_raw_error,
-            on_close=on_raw_close,
-            on_open=on_raw_open
+            on_message=on_websocket_message,
+            on_error=on_websocket_error,
+            on_close=on_websocket_close,
+            on_open=on_websocket_open
         )
         ws.start()
         log_message(f"Raw WebSocket client started on URL: {ws_url}", section="SYSTEM")
@@ -1321,26 +1287,6 @@ def initialize_raw_websocket():
     except Exception as e:
         log_message(f"Exception initializing raw WebSocket: {e}", section="ERROR")
         return None
-
-def initialize_websocket():
-    """
-    Initializes the WebSocket connection.
-    Tries the SDK first, and falls back to a raw WebSocket if it fails.
-    """
-    log_message("Attempting to connect via OKX SDK...", section="WS")
-    sdk_ws = initialize_sdk_websocket()
-    if sdk_ws:
-        log_message("✓ SDK WebSocket connection successful.", section="WS")
-        return sdk_ws
-
-    log_message("SDK connection failed, falling back to raw WebSocket.", section="WS")
-    raw_ws = initialize_raw_websocket()
-    if raw_ws:
-        log_message("✓ Raw WebSocket connection successful.", section="WS")
-        return raw_ws
-
-    log_message("✗ All WebSocket connection methods failed.", section="CRITICAL_ERROR")
-    return None
 
 # ================================================================================
 
