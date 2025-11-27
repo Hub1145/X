@@ -777,7 +777,7 @@ def okx_transfer_funds(ccy, amount, from_account, to_account):
 
 def update_account_info():
     """Updates global account balance for OKX contracts and prints it.
-    Fallback to overall account equity if currency-specific details are missing.
+    Now correctly prioritizes overall equity for unified accounts.
     """
     global account_balance, available_balance
 
@@ -815,38 +815,29 @@ def update_account_info():
 
         if response_trading and response_trading.get('code') == '0':
             data = response_trading.get('data', [])
-            if data:
-                currency_details = None
-                try:
-                    currency_details = next((item for item in data[0].get('details', []) if item.get('ccy') == CURRENCY), None)
-                except Exception:
-                    currency_details = None
+            if data and isinstance(data, list) and len(data) > 0:
+                account_details = data[0]
+                new_total_balance = safe_float(account_details.get('totalEq', '0'))
 
-                new_total_balance = 0.0
-                new_avail_balance = 0.0
+                # For unified accounts, 'availEq' at the top level is the key metric for new positions.
+                # The 'details' array might not contain the futures balance directly.
+                new_avail_balance = safe_float(account_details.get('availEq', '0'))
 
-                if currency_details:
-                    new_total_balance = safe_float(currency_details.get('eq', '0'))
-                    new_avail_balance = safe_float(currency_details.get('availEq', '0'))
-                    log_message(f"Found specific currency details for {CURRENCY}: Total={new_total_balance:.8f}, Available={new_avail_balance:.8f}", section="ACCOUNT")
-                else:
-                    overall = data[0]
-                    new_total_balance = safe_float(overall.get('totalEq', '0'))
-                    new_avail_balance = safe_float(overall.get('availEq', '0'))
-                    if new_total_balance > 0 or new_avail_balance > 0:
-                        log_message("Using overall account equity (totalEq/availEq) as currency-specific details were missing.", section="ACCOUNT")
-                    else:
-                        log_message(f"Currency-specific details for {CURRENCY} missing and overall equity is zero. This suggests no usable trading balance.", section="ERROR")
-                        return False
+                log_message(f"Unified Account Equity: Total={new_total_balance:.8f}, Available={new_avail_balance:.8f}", section="ACCOUNT")
+
+                log_message(f"DEBUG: Parsed new_total_balance: {new_total_balance}, new_avail_balance: {new_avail_balance}", section="DEBUG")
+
+                if new_avail_balance <= 0:
+                    log_message(f"Available equity is zero or less. This suggests no usable trading balance.", section="WARNING")
 
                 with account_info_lock:
                     account_balance = new_total_balance
                     available_balance = new_avail_balance
-                    log_message(f"Total Balance: {account_balance:.8f} {CURRENCY}", section="ACCOUNT")
-                    log_message(f"Available Balance: {available_balance:.8f} {CURRENCY}", section="ACCOUNT")
-                    return True
+                    log_message(f"Total Balance Updated: {account_balance:.8f} {CURRENCY}", section="ACCOUNT")
+                    log_message(f"Available Balance Updated: {available_balance:.8f} {CURRENCY}", section="ACCOUNT")
+                return True
             else:
-                log_message("OKX Trading Account data missing in response", section="ERROR")
+                log_message("OKX Trading Account data missing or malformed in response", section="ERROR")
                 return False
         else:
             log_message(f"Failed to fetch OKX Trading Account info: {response_trading.get('msg') if response_trading else 'No response'}", section="ERROR")
@@ -946,7 +937,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
 
         all_data = []
         max_candles_limit = 100
-        
+
         current_before_ms = None
 
         while True:
@@ -979,16 +970,16 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                         except (ValueError, TypeError, IndexError) as e:
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
-                    
+
                     all_data.extend(parsed_klines)
-                    
+
                     oldest_ts = int(rows[-1][0])
                     current_before_ms = oldest_ts
 
                     if oldest_ts <= start_ts_ms or len(rows) < max_candles_limit:
-                        break 
+                        break
                 else:
-                    break 
+                    break
 
                 sleep(0.3)
             else:
@@ -999,7 +990,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         final_data = final_data.drop_duplicates(subset=['Timestamp'])
         final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
-        
+
         return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
@@ -1198,7 +1189,7 @@ def on_websocket_message(ws_app, message):
                     timeframe_key = timeframe_key.replace('H', 'h').lower()
                 elif timeframe_key.endswith('D'):
                     timeframe_key = timeframe_key.replace('D', 'd').lower()
-                
+
                 parsed_klines = [
                     [int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
                     for k in data if len(k) >= 6
@@ -1210,7 +1201,7 @@ def on_websocket_message(ws_app, message):
 
             elif channel == 'positions' and data:
                 detect_sl_from_position_update(data)
-                
+
     except json.JSONDecodeError:
         pass
     except Exception as e:
@@ -1218,23 +1209,23 @@ def on_websocket_message(ws_app, message):
 
 def on_websocket_open(ws_app):
     log_message("OKX WebSocket connection opened.", section="WS")
-    
+
     # Subscribe to channels
     okx_timeframe_map = {
         '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
         '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '8h': '8H',
         '12h': '12H', '1d': '1D', '1w': '1W', '1M': '1M'
     }
-    
+
     channels = [
         {"channel": "trades", "instId": SYMBOL},
     ]
-    
+
     for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
         okx_channel = okx_timeframe_map.get(tf.lower())
         if okx_channel:
             channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
-            
+
     ws.subscribe(channels)
 
 def on_websocket_error(ws_app, error):
@@ -1249,7 +1240,7 @@ def initialize_websocket():
     """
     global ws
     ws_url = get_ws_url()
-    
+
     try:
         ws = RawOkxSocketClient(
             url=ws_url,
