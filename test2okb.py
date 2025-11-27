@@ -51,8 +51,8 @@ MANUAL_TEST_CONFIG = {
     'price_offset_percent': 0.1,
     'force_entry': True,
     'immediate_order': True,
-    'test_tp_after_seconds': 6000,
-    'test_eod_after_seconds': 6000,
+    'test_tp_after_seconds': 60,
+    'test_eod_after_seconds': 120,
 }
 
 # ================================================================================
@@ -264,7 +264,6 @@ def generate_okx_signature(timestamp, method, request_path, body_str=''):
 # ================================================================================
 
 def okx_request(method, path, params=None, body_dict=None, max_retries=3):
-    url = f"{REST_API_BASE_URL}{path}"
     local_dt = datetime.datetime.now(datetime.timezone.utc)
     adjusted_dt = local_dt + datetime.timedelta(milliseconds=server_time_offset)
     timestamp = adjusted_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
@@ -275,9 +274,12 @@ def okx_request(method, path, params=None, body_dict=None, max_retries=3):
         body_str = json.dumps(body_dict, separators=(',', ':'), sort_keys=True)
 
     request_path_for_signing = path
+    final_url = f"{REST_API_BASE_URL}{path}"
+
     if params and method.upper() == 'GET':
         query_string = '?' + '&'.join([f'{k}={v}' for k, v in sorted(params.items())])
-        request_path_for_signing = path + query_string
+        request_path_for_signing += query_string
+        final_url += query_string
 
     signature = generate_okx_signature(timestamp, method, request_path_for_signing, body_str)
 
@@ -304,11 +306,8 @@ def okx_request(method, path, params=None, body_dict=None, max_retries=3):
             if body_dict and method.upper() in ['POST', 'PUT', 'DELETE']:
                 kwargs['data'] = body_str
 
-            if params and method.upper() == 'GET':
-                kwargs['params'] = params
-
             log_message(f"{method} {path} (Attempt {attempt + 1}/{max_retries})", section="API")
-            response = req_func(url, **kwargs)
+            response = req_func(final_url, **kwargs)
 
             if response.status_code != 200:
                 try:
@@ -752,29 +751,6 @@ def handle_eod_exit():
 
 # ================================================================================
 
-def okx_transfer_funds(ccy, amount, from_account, to_account):
-    try:
-        path = "/api/v5/asset/transfer"
-        body = {
-            "ccy": ccy,
-            "amt": str(amount),
-            "from": str(from_account),
-            "to": str(to_account)
-        }
-        log_message(f"Attempting to transfer {amount} {ccy} from account {from_account} to {to_account}...", section="ACCOUNT")
-        response = okx_request("POST", path, body_dict=body)
-
-        if response and response.get('code') == '0':
-            transfer_id = response.get('data', [{}])[0].get('transId')
-            log_message(f"✓ Funds transfer initiated. Transfer ID: {transfer_id}", section="ACCOUNT")
-            return True
-        else:
-            log_message(f"✗ Funds transfer failed: {response.get('msg', 'Unknown error') if response else 'No response'}", section="ERROR")
-            return False
-    except Exception as e:
-        log_message(f"Exception in okx_transfer_funds: {e}", section="ERROR")
-        return False
-
 def update_account_info():
     """Updates global account balance for OKX contracts and prints it.
     Now correctly prioritizes overall equity for unified accounts.
@@ -782,32 +758,7 @@ def update_account_info():
     global account_balance, available_balance
 
     try:
-        # Step 1: Check Funding Account for USDT balance (optional)
-        path_funding = "/api/v5/asset/balances"
-        params_funding = {"ccy": CURRENCY}
-        response_funding = okx_request("GET", path_funding, params=params_funding)
-        log_message(f"Funding Account Balance Response: {response_funding}", section="DEBUG")
-
-        if response_funding and response_funding.get('code') == '0':
-            funding_data = response_funding.get('data', [])
-            usdt_in_funding = 0.0
-            if funding_data:
-                for item in funding_data:
-                    if item.get('ccy') == CURRENCY:
-                        usdt_in_funding = safe_float(item.get('availBal', '0'))
-                        break
-            log_message(f"USDT in Funding Account: {usdt_in_funding}", section="ACCOUNT")
-
-            if usdt_in_funding > 0:
-                log_message(f"Found {usdt_in_funding:.8f} {CURRENCY} in Funding Account. Attempting transfer to Trading Account...", section="ACCOUNT")
-                transfer_success = okx_transfer_funds(CURRENCY, usdt_in_funding, 6, 18)  # 6: Funding, 18: Trading
-                log_message(f"Funds transfer success: {transfer_success}", section="ACCOUNT")
-                if transfer_success:
-                    sleep(2)
-                else:
-                    log_message("Failed to transfer funds from Funding to Trading Account. Will continue but balances may be insufficient.", section="WARNING")
-
-        # Step 2: Now check Trading Account for balance
+        # Step 1: Now check Trading Account for balance
         path_trading = "/api/v5/account/balance"
         params_trading = {"ccy": CURRENCY}
         response_trading = okx_request("GET", path_trading, params=params_trading)
@@ -818,7 +769,7 @@ def update_account_info():
             if data and isinstance(data, list) and len(data) > 0:
                 account_details = data[0]
                 new_total_balance = safe_float(account_details.get('totalEq', '0'))
-                
+
                 # For unified accounts, 'availEq' at the top level is the key metric for new positions.
                 # The 'details' array might not contain the futures balance directly.
                 new_avail_balance = safe_float(account_details.get('availEq', '0'))
@@ -829,7 +780,7 @@ def update_account_info():
 
                 if new_avail_balance <= 0:
                     log_message(f"Available equity is zero or less. This suggests no usable trading balance.", section="WARNING")
-                
+
                 with account_info_lock:
                     account_balance = new_total_balance
                     available_balance = new_avail_balance
@@ -930,14 +881,15 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
             return []
 
         start_dt = datetime.datetime.strptime(start_date_str, '%Y-%m-%d').replace(tzinfo=datetime.timezone.utc)
-        end_dt = datetime.datetime.strptime(end_date_str, '%Y-%m-%d').replace(tzinfo=datetime.timezone.utc)
+        # Ensure the end date is inclusive by setting the time to the end of the day
+        end_dt = datetime.datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=datetime.timezone.utc)
 
         start_ts_ms = int(start_dt.timestamp() * 1000)
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         all_data = []
         max_candles_limit = 100
-        
+
         current_before_ms = None
 
         while True:
@@ -950,7 +902,6 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                 params["before"] = str(current_before_ms)
 
             response = okx_request("GET", path, params=params)
-            log_message(f"OKX history API response for {timeframe}: {response}", section="DEBUG")
 
             if response and response.get('code') == '0':
                 rows = response.get('data', [])
@@ -970,16 +921,16 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
                         except (ValueError, TypeError, IndexError) as e:
                             log_message(f"Error parsing OKX kline: {kline} - {e}", section="ERROR")
                             continue
-                    
+
                     all_data.extend(parsed_klines)
-                    
+
                     oldest_ts = int(rows[-1][0])
                     current_before_ms = oldest_ts
 
                     if oldest_ts <= start_ts_ms or len(rows) < max_candles_limit:
-                        break 
+                        break
                 else:
-                    break 
+                    break
 
                 sleep(0.3)
             else:
@@ -990,7 +941,7 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         final_data = pd.DataFrame(all_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         final_data = final_data.drop_duplicates(subset=['Timestamp'])
         final_data = final_data[(final_data['Timestamp'] >= start_ts_ms) & (final_data['Timestamp'] <= end_ts_ms)]
-        
+
         return final_data.values.tolist()
     except Exception as e:
         log_message(f"Exception in fetch_historical_data_okx: {e}", section="ERROR")
@@ -1189,7 +1140,7 @@ def on_websocket_message(ws_app, message):
                     timeframe_key = timeframe_key.replace('H', 'h').lower()
                 elif timeframe_key.endswith('D'):
                     timeframe_key = timeframe_key.replace('D', 'd').lower()
-                
+
                 parsed_klines = [
                     [int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
                     for k in data if len(k) >= 6
@@ -1201,7 +1152,7 @@ def on_websocket_message(ws_app, message):
 
             elif channel == 'positions' and data:
                 detect_sl_from_position_update(data)
-                
+
     except json.JSONDecodeError:
         pass
     except Exception as e:
@@ -1209,23 +1160,23 @@ def on_websocket_message(ws_app, message):
 
 def on_websocket_open(ws_app):
     log_message("OKX WebSocket connection opened.", section="WS")
-    
+
     # Subscribe to channels
     okx_timeframe_map = {
         '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
         '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '8h': '8H',
         '12h': '12H', '1d': '1D', '1w': '1W', '1M': '1M'
     }
-    
+
     channels = [
         {"channel": "trades", "instId": SYMBOL},
     ]
-    
+
     for tf in [TIMEFRAME_CPR, TIMEFRAME_TRADE]:
         okx_channel = okx_timeframe_map.get(tf.lower())
         if okx_channel:
             channels.append({"channel": f"candle{okx_channel}", "instId": SYMBOL})
-            
+
     ws.subscribe(channels)
 
 def on_websocket_error(ws_app, error):
@@ -1240,7 +1191,7 @@ def initialize_websocket():
     """
     global ws
     ws_url = get_ws_url()
-    
+
     try:
         ws = RawOkxSocketClient(
             url=ws_url,
@@ -1997,34 +1948,23 @@ def get_latest_data_and_indicators():
         with data_lock:
             daily_df = historical_data_store.get(TIMEFRAME_CPR)
 
-        if daily_df is None or len(daily_df) < 52:
-            log_message(f"Insufficient daily data", section="ERROR")
+        if daily_df is None or len(daily_df) < 2:
+            log_message(f"Insufficient daily data: got {len(daily_df) if daily_df is not None else 0} candles", section="ERROR")
             return None
 
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        today = now_utc.date()
+        # To be robust against API data lag, use the last two candles available.
+        # [-2] is the last fully closed candle ("previous day").
+        # [-1] is the current, incomplete candle ("today").
+        prev_candle = daily_df.iloc[-2]
+        current_candle = daily_df.iloc[-1]
 
-        df_dates = daily_df.index.date
-        yesterday = today - datetime.timedelta(days=1)
+        prev_date = prev_candle.name.date()
+        current_date = current_candle.name.date()
 
-        yesterday_mask = df_dates == yesterday
+        # Sanity check for large gaps, though we proceed anyway.
+        if (current_date - prev_date).days > 2:
+             log_message(f"Warning: Large gap between last two candles. Previous: {prev_date}, Current: {current_date}", section="CALC")
 
-        if yesterday_mask.any():
-            prev_candle = daily_df[yesterday_mask].iloc[-1]
-            prev_date = yesterday
-        else:
-            prev_candle = daily_df.iloc[-1]
-            prev_date = daily_df.index[-1].date()
-            log_message(f"Warning: Yesterday's data not found, using last available: {prev_date}", section="CALC")
-
-        today_mask = df_dates == today
-
-        if today_mask.any():
-            current_candle = daily_df[today_mask].iloc[-1]
-            current_date = today
-        else:
-            current_candle = daily_df.iloc[-1]
-            current_date = daily_df.index[-1].date()
 
         prev_open = prev_candle['Open']
         prev_high = prev_candle['High']
@@ -2033,7 +1973,7 @@ def get_latest_data_and_indicators():
         daily_open = current_candle['Open']
 
         if prev_high < prev_low:
-            log_message(f"CRITICAL: Data corruption! Prev High < Low", section="ERROR")
+            log_message(f"CRITICAL: Data corruption! Prev High < Low on {prev_date}", section="ERROR")
             return None
 
         daily_cpr = calculate_cpr_levels(prev_high, prev_low, prev_close)
@@ -2042,6 +1982,7 @@ def get_latest_data_and_indicators():
             log_message("Failed to calculate CPR levels", section="ERROR")
             return None
 
+        # Indicators are calculated on the full history, result is based on the last candle.
         indicator_results_df = calculate_indicators(daily_df.copy())
 
         if indicator_results_df is None or indicator_results_df.empty:
@@ -2404,18 +2345,21 @@ def main():
             manual_test_thread.start()
             manual_test_monitor_thread = threading.Thread(target=manual_test_monitor, name="ManualTestMonitor", daemon=True)
             manual_test_monitor_thread.start()
+
+            manual_test_thread.join()
+            manual_test_monitor_thread.join()
         else:
             trading_logic_thread = threading.Thread(target=main_trading_logic, name="TradingLogic", daemon=True)
             trading_logic_thread.start()
 
-        live_monitor_thread = threading.Thread(target=live_position_monitor, name="LiveMonitor", daemon=True)
-        live_monitor_thread.start()
+            live_monitor_thread = threading.Thread(target=live_position_monitor, name="LiveMonitor", daemon=True)
+            live_monitor_thread.start()
 
-        cleanup_thread = threading.Thread(target=cleanup_memory, name="GarbageCollector", daemon=True)
-        cleanup_thread.start()
+            cleanup_thread = threading.Thread(target=cleanup_memory, name="GarbageCollector", daemon=True)
+            cleanup_thread.start()
 
-        while not shutdown_flag.is_set():
-            sleep(1)
+            while not shutdown_flag.is_set():
+                sleep(1)
 
     except KeyboardInterrupt:
         log_message("Shutdown initiated by user (KeyboardInterrupt)", section="SYSTEM")
