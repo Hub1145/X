@@ -256,6 +256,7 @@ def generate_okx_signature(timestamp, method, request_path, body_str=''):
     Returns Base64-encoded HMAC-SHA256 digest.
     """
     message = str(timestamp) + method.upper() + request_path + body_str
+    log_message(f"String to sign: '{message}'", section="DEBUG")
     hashed = hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
     signature = base64.b64encode(hashed.digest()).decode('utf-8')
     return signature
@@ -275,9 +276,8 @@ def okx_request(method, path, params=None, body_dict=None, max_retries=3):
 
     request_path_for_signing = path
     if params and method.upper() == 'GET':
-        sorted_params = sorted(params.items())
-        query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-        request_path_for_signing = f"{path}?{query_string}"
+        query_string = '?' + '&'.join([f'{k}={v}' for k, v in sorted(params.items())])
+        request_path_for_signing = path + query_string
 
     signature = generate_okx_signature(timestamp, method, request_path_for_signing, body_str)
 
@@ -777,7 +777,7 @@ def okx_transfer_funds(ccy, amount, from_account, to_account):
 
 def update_account_info():
     """Updates global account balance for OKX contracts and prints it.
-    Fallback to overall account equity if currency-specific details are missing.
+    Now correctly prioritizes overall equity for unified accounts.
     """
     global account_balance, available_balance
 
@@ -815,38 +815,29 @@ def update_account_info():
 
         if response_trading and response_trading.get('code') == '0':
             data = response_trading.get('data', [])
-            if data:
-                currency_details = None
-                try:
-                    currency_details = next((item for item in data[0].get('details', []) if item.get('ccy') == CURRENCY), None)
-                except Exception:
-                    currency_details = None
+            if data and isinstance(data, list) and len(data) > 0:
+                account_details = data[0]
+                new_total_balance = safe_float(account_details.get('totalEq', '0'))
+                
+                # For unified accounts, 'availEq' at the top level is the key metric for new positions.
+                # The 'details' array might not contain the futures balance directly.
+                new_avail_balance = safe_float(account_details.get('availEq', '0'))
 
-                new_total_balance = 0.0
-                new_avail_balance = 0.0
+                log_message(f"Unified Account Equity: Total={new_total_balance:.8f}, Available={new_avail_balance:.8f}", section="ACCOUNT")
 
-                if currency_details:
-                    new_total_balance = safe_float(currency_details.get('eq', '0'))
-                    new_avail_balance = safe_float(currency_details.get('availEq', '0'))
-                    log_message(f"Found specific currency details for {CURRENCY}: Total={new_total_balance:.8f}, Available={new_avail_balance:.8f}", section="ACCOUNT")
-                else:
-                    overall = data[0]
-                    new_total_balance = safe_float(overall.get('totalEq', '0'))
-                    new_avail_balance = safe_float(overall.get('availEq', '0'))
-                    if new_total_balance > 0 or new_avail_balance > 0:
-                        log_message("Using overall account equity (totalEq/availEq) as currency-specific details were missing.", section="ACCOUNT")
-                    else:
-                        log_message(f"Currency-specific details for {CURRENCY} missing and overall equity is zero. This suggests no usable trading balance.", section="ERROR")
-                        return False
+                log_message(f"DEBUG: Parsed new_total_balance: {new_total_balance}, new_avail_balance: {new_avail_balance}", section="DEBUG")
 
+                if new_avail_balance <= 0:
+                    log_message(f"Available equity is zero or less. This suggests no usable trading balance.", section="WARNING")
+                
                 with account_info_lock:
                     account_balance = new_total_balance
                     available_balance = new_avail_balance
-                    log_message(f"Total Balance: {account_balance:.8f} {CURRENCY}", section="ACCOUNT")
-                    log_message(f"Available Balance: {available_balance:.8f} {CURRENCY}", section="ACCOUNT")
-                    return True
+                    log_message(f"Total Balance Updated: {account_balance:.8f} {CURRENCY}", section="ACCOUNT")
+                    log_message(f"Available Balance Updated: {available_balance:.8f} {CURRENCY}", section="ACCOUNT")
+                return True
             else:
-                log_message("OKX Trading Account data missing in response", section="ERROR")
+                log_message("OKX Trading Account data missing or malformed in response", section="ERROR")
                 return False
         else:
             log_message(f"Failed to fetch OKX Trading Account info: {response_trading.get('msg') if response_trading else 'No response'}", section="ERROR")
