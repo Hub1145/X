@@ -890,7 +890,8 @@ def fetch_historical_data_okx(symbol, timeframe, start_date_str, end_date_str):
         all_data = []
         max_candles_limit = 100
 
-        current_before_ms = None
+        # Initialize pagination by starting from the requested end date to ensure data is fresh.
+        current_before_ms = end_ts_ms
 
         while True:
             params = {
