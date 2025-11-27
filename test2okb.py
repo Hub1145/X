@@ -2212,6 +2212,14 @@ def process_new_candle_and_check_entry():
         log_message(f"🕐 NEW DAILY CANDLE - Entry Check @ {datetime.datetime.now(datetime.timezone.utc)}", section="TRADE")
         log_message("=" * 80, section="TRADE")
 
+        log_message("Re-fetching latest daily data to prevent staleness...", section="DATA")
+        adjusted_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(milliseconds=server_time_offset)
+        today = adjusted_now.date()
+        start_date = today - datetime.timedelta(days=HISTORICAL_DATA_MONTHS * 30)
+        if not fetch_initial_historical_data(SYMBOL, TIMEFRAME_CPR, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')):
+            log_message("Failed to re-fetch daily data. Aborting entry check.", section="ERROR")
+            return
+
         calculated_data = get_latest_data_and_indicators()
 
         if not calculated_data:
